@@ -1,0 +1,511 @@
+# Potrebni paketi
+library(tidygeocoder)
+library(leaflet)
+library(dplyr)
+library(shiny)
+library(readr)
+library(tidyverse)
+library(lubridate)
+library(ggplot2)
+library(plotly)
+library(DT)
+library(stringr)
+library(cowplot)
+
+
+
+load_sport_data <- function(file_path) {
+  read_csv(file_path, col_types = cols(.default = "c")) %>%
+    mutate(across(where(is.character), ~na_if(., "")))
+}
+
+
+
+
+load_sport_data <- function(folder_path) {
+  files <- list.files(folder_path, full.names = TRUE, pattern = "\\.csv$")
+
+  data <- map_df(files, function(file) {
+    df <- read_csv(file, col_types = cols(.default = "c"))  # Učitaj sve kolone kao character
+    df <- df %>% mutate(across(where(is.character), ~na_if(., "")))  # Zameni prazne stringove sa NA
+    return(df)
+  })
+
+  return(data)
+}
+
+
+load_medal_data <- function(folder_path) {
+  files <- list.files(folder_path, full.names = TRUE, pattern = "\\.csv$")
+
+  data <- map_df(files, function(file) {
+    filename <- basename(file)
+    year <- as.numeric(str_extract(filename, "\\d{4}"))
+    if (is.na(year)) {
+      warning(paste("Could not extract year from filename:", filename))
+      return(NULL)
+    }
+
+    df <- read_csv(file, col_types = cols(
+      NOC = col_character(),
+      Gold = col_number(),
+      Silver = col_number(),
+      Bronze = col_number(),
+      Total = col_number()
+    ))
+    df$Year <- year
+    return(df)
+  })
+
+}
+# Učitaj podatke iz CSV datoteka
+torch_data <- read_csv("C:/Users/Dusan/OneDrive - UPR/FAMNIT/II semestar/Vizualizacija podatkov/projekat ol/archive(1)/torch_route.csv")
+rank_data <- read_csv("C:/Users/Dusan/OneDrive - UPR/FAMNIT/II semestar/Vizualizacija podatkov/projekat ol/archive(1)/medals.csv")
+sport_data <- load_sport_data("C:/Users/Dusan/OneDrive - UPR/FAMNIT/II semestar/Vizualizacija podatkov/projekat ol/archive(1)/results")
+athletes_data <- read_csv("C:/Users/Dusan/OneDrive - UPR/FAMNIT/II semestar/Vizualizacija podatkov/projekat ol/archive(1)/athletes.csv")
+team_data<-read_csv("C:/Users/Dusan/OneDrive - UPR/FAMNIT/II semestar/Vizualizacija podatkov/projekat ol/archive(1)/teams.csv")
+
+
+# Geokodiranje za dobijanje lat i lon na osnovu imena gradova
+torch_data <- torch_data %>%
+  filter(!is.na(city)) %>%  # Filtriraj redove koji imaju naziv grada
+  geocode(city, method = 'osm', lat = lat, long = lon)
+
+# Pretvorimo datume u POSIXct format radi lakšeg rukovanja
+torch_data$date_start <- as.POSIXct(torch_data$date_start, format="%Y-%m-%dT%H:%M:%SZ", tz="UTC")
+torch_data$date_end <- as.POSIXct(torch_data$date_end, format="%Y-%m-%dT%H:%M:%SZ", tz="UTC")
+
+# Pripremimo rank_data
+rank_data <- rank_data %>%
+  mutate(medal_date = as.Date(medal_date)) %>%
+  mutate(medal_value = case_when(
+    medal_type == "Gold Medal" ~ 3,
+    medal_type == "Silver Medal" ~ 2,
+    medal_type == "Bronze Medal" ~ 1,
+    TRUE ~ 0
+  ))
+
+# Funkcija za vizualizaciju putanje olimpijske baklje
+vizualizuj_baklju <- function(torch_data, input_date) {
+  # Filtriraj podatke prema izabranom datumu
+  filtered_data <- torch_data %>%
+    filter(date_start <= input_date) %>%  # Prikaži sve lokacije do izabranog datuma
+    arrange(date_start)  # Sortiraj prema datumu da linija prati hronološki redosled
+
+  # Kreiraj mapu sa markerima i linijama
+  leaflet() %>%
+    addTiles() %>%
+    addMarkers(data = filtered_data, ~lon, ~lat, popup = ~paste("<strong>", title, "</strong><br>",
+                                                                "City: ", city, "<br>",
+                                                                "Start: ", date_start, "<br>",
+                                                                "End: ", date_end, "<br>",
+                                                                "URL: <a href='", url, "'>", url, "</a>")) %>%
+    addPolylines(data = filtered_data, ~lon, ~lat, color = "blue", weight = 4, opacity = 0.7)
+}
+
+# Funkcija za vizualizaciju rangiranja zemalja
+vizualizuj_rangiranje <- function(rank_data, date_range) {
+  filtered_data <- rank_data %>%
+    filter(medal_date >= date_range[1] & medal_date <= date_range[2]) %>%
+    group_by(country_code, medal_date) %>%
+    summarise(daily_medals = sum(medal_value), .groups = "drop") %>%
+    arrange(medal_date) %>%
+    group_by(country_code) %>%
+    mutate(cumulative_medals = cumsum(daily_medals)) %>%
+    ungroup()
+
+  # Računanje dnevnog ranga
+  daily_ranks <- filtered_data %>%
+    group_by(medal_date) %>%
+    mutate(rank = rank(-cumulative_medals, ties.method = "min")) %>%
+    ungroup()
+
+  # Odabir top 10 zemalja po ukupnom broju medalja
+  top_countries <- daily_ranks %>%
+    group_by(country_code) %>%
+    summarise(total_medals = sum(daily_medals), .groups = "drop") %>%
+    top_n(10, total_medals) %>%
+    pull(country_code)
+
+  # Filtriranje podataka samo za top 10 zemalja
+  plot_data <- daily_ranks %>%
+    filter(country_code %in% top_countries)
+
+  # Kreiranje grafa
+  p <- ggplot(plot_data, aes(x = medal_date, y = rank, color = country_code, group = country_code)) +
+    geom_line(size = 1) +
+    geom_point(size = 2) +
+    scale_y_reverse(breaks = 1:10) +
+    scale_color_viridis_d() +
+    labs(title = "Countries ranked by overall medals after each competition day",
+         x = "Competition day",
+         y = "Rank",
+         color = "Country") +
+    theme_minimal() +
+    theme(legend.position = "right")
+
+  # Pretvaranje ggplot u interaktivni plotly graf
+  ggplotly(p)
+}
+
+
+
+# Funkcija za vizualizaciju distribucije godina medalista
+vizualizuj_godine_medalista <- function(athletes_data, rank_data, team_data, selected_sports = NULL) {
+  # Osigurajmo da je 'code' kolona character tip u svim dataframe-ovima
+  athletes_data <- athletes_data %>% mutate(code = as.character(code))
+  rank_data <- rank_data %>% mutate(code = as.character(code))
+  team_data <- team_data %>% mutate(code = as.character(code))
+
+  # Spajanje podataka o medaljama sa podacima o sportistima
+  merged_data <- rank_data %>%
+    left_join(athletes_data, by = "code") %>%
+    filter(!is.na(medal_type))  # Izbacivanje onih koji nisu osvojili medalju
+
+  # Obrada timskih medalja
+  team_medals <- merged_data %>%
+    filter(is.na(birth_date)) %>%
+    left_join(team_data, by = "code") %>%
+    mutate(athletes_codes = strsplit(athletes_codes, ",")) %>%
+    unnest(athletes_codes) %>%
+    left_join(athletes_data, by = c("athletes_codes" = "code")) %>%
+    select(-birth_date.x) %>%
+    rename(birth_date = birth_date.y)
+
+  # Spajanje individualnih i timskih medalja
+  all_medals <- bind_rows(
+    merged_data %>% filter(!is.na(birth_date)),
+    team_medals
+  )
+
+  # Računanje starosti
+  all_medals <- all_medals %>%
+    mutate(birth_date = ymd(birth_date),
+           age = year(as.Date("2024-07-26")) - year(birth_date))  # Pretpostavljeni datum OI 2024
+
+  # Filtriranje po izabranim sportovima
+  if (!is.null(selected_sports) && length(selected_sports) > 0) {
+    all_medals <- all_medals %>% filter(discipline %in% selected_sports)
+  }
+
+  # Kreiranje grafikona
+  p <- ggplot(all_medals, aes(x = discipline, y = age, fill = medal_type)) +
+    geom_boxplot() +
+    labs(title = "Porazdelitev starosti medalistov po disciplini in tipu medalje",
+         x = "Disciplina",
+         y = "Starost",
+         fill = "Tip medalje") +
+    scale_fill_manual(values = c("Gold Medal" = "#FFD700",
+                                 "Silver Medal" = "#C0C0C0",
+                                 "Bronze Medal" = "#CD7F32")) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          legend.position = "right") +
+    coord_flip()
+
+  return(p)
+}
+
+
+
+visualize_medal_table <- function(medal_data, selected_countries = NULL) {
+  if (!is.null(selected_countries) && length(selected_countries) > 0) {
+    medal_data <- medal_data %>% filter(NOC %in% selected_countries)
+  }
+
+  plot_data <- medal_data %>%
+    gather(key = "Medal", value = "Count", Gold, Silver, Bronze) %>%
+    mutate(Medal = factor(Medal, levels = c("Gold", "Silver", "Bronze")))
+
+  p <- ggplot(plot_data, aes(x = Year, y = NOC, size = Count, color = Medal)) +
+    geom_point(alpha = 0.7) +
+    scale_color_manual(values = c("Gold" = "#FFD700", "Silver" = "#C0C0C0", "Bronze" = "#CD7F32")) +
+    scale_size_continuous(range = c(1, 15)) +
+    labs(title = "Olympic Summer Games Medal Table",
+         subtitle = "Hover over a dot to see the medal distribution.",
+         x = "Year", y = "Country") +
+    theme_minimal() +
+    theme(legend.position = "bottom",
+          axis.text.y = element_text(size = 8))
+
+  ggplotly(p, tooltip = c("NOC", "Year", "Medal", "Count"))
+}
+
+visualize_athlete_counts_by_gender <- function(athletes_data, team_data, selected_countries_2 = c("USA", "SRB", "SLO", "FRA", "GRE")) {
+  # Osigurajmo da je 'code' kolona character tip u svim dataframe-ovima
+ # athletes_data <- athletes_data %>% mutate(code = as.character(code))
+  #team_data <- team_data %>% mutate(code = as.character(code))
+
+
+  # Izračunaj broj sportista po zemlji i polu
+  athlete_counts <- athletes_data %>%
+    group_by(country_code, gender) %>%
+    summarize(count = n()) %>%
+    ungroup()
+
+  # Kreiraj grafikon
+  p <- ggplot(athlete_counts, aes(x = country_code, y = count, fill = gender)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    labs(title = "Broj sportista po zemljama i polu",
+         x = "Zemlja", y = "Broj sportista", fill = "Pol") +
+    scale_fill_manual(values = c("Male" = "#1f77b4", "Female" = "#ff1d8d")) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1),
+          legend.position = "right")
+
+  # Filtriranje po zadatim zemljama
+  p + coord_flip() +
+    scale_x_discrete(limits = selected_countries_2)
+}
+
+# Broj medalja po zemljama i polu
+visualize_medal_counts_by_gender <- function(rank_data, team_data, selected_countries_2=c("USA", "SRB", "SLO", "FRA", "GRE")) {
+
+  # Spojimo individualne i timske medalje
+  all_medals <- bind_rows(
+    rank_data %>% mutate(gender = "Individual"),
+    team_data %>%
+      mutate(athletes_codes = strsplit(athletes_codes, ",")) %>%
+      unnest(athletes_codes) %>%
+      left_join(rank_data, by = c("athletes_codes" = "code")) %>%
+      mutate(gender = "Team")
+  )
+
+  # Izračunaj broj medalja po zemlji i polu
+  medal_counts <- rank_data %>%
+    filter(gender %in% c("M", "W")) %>%
+    group_by(country_code, gender) %>%
+    summarize(count = n()) %>%
+    ungroup()
+
+  # Kreiraj grafikon
+  p <- ggplot(medal_counts, aes(x = country_code, y = count, fill = gender)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    labs(title = "Broj medalja po zemljama i polu",
+         x = "Zemlja", y = "Broj medalja", fill = "Pol") +
+    scale_fill_manual(values = c("M" = "#1f77b4", "W" = "#ff1d8d")) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1),
+          legend.position = "right")
+
+  # Filtriranje po zadatim zemljama
+  p + coord_flip() +
+      scale_x_discrete(limits = selected_countries_2)
+}
+
+# Razlika u težini između muških i ženskih sportista
+visualize_weight_differences <- function(athletes_data, team_data) {
+
+
+
+  # Kreiraj grafikon
+  p <- ggplot(athletes_data, aes(x = gender, y = weight)) +
+    geom_boxplot() +
+    labs(title = "Razlika u težini između muških i ženskih sportista",
+         x = "Pol", y = "Težina (kg)") +
+    scale_x_discrete(labels = c("Žene", "Muškarci")) +
+    theme_minimal()
+
+  return(p)
+}
+
+# Razlika u visini između muških i ženskih sportista
+visualize_height_differences <- function(athletes_data, team_data) {
+
+
+
+
+  # Kreiraj grafikon
+  p <- ggplot(athletes_data, aes(x = gender, y = height)) +
+    geom_boxplot() +
+    labs(title = "Razlika u visini između muških i ženskih sportista",
+         x = "Pol", y = "Visina (cm)") +
+    scale_x_discrete(labels = c("Žene", "Muškarci")) +
+    scale_y_continuous(limits = c(140, NA)) +  # Postavljanje donje granice y-ose na 140
+    theme_minimal()
+
+
+
+  return(p)
+}
+
+
+# Kreiranje Shiny aplikacije sa navigacionim menijem
+ui <- navbarPage("Olimpijske Igre 2024",
+
+                 # Prva vizualizacija - Putanja Olimpijske Baklje
+                 tabPanel("Putanja Baklje",
+                          sidebarLayout(
+                            sidebarPanel(
+                              sliderInput("date", "Izaberite datum:",
+                                          min = min(torch_data$date_start),
+                                          max = max(torch_data$date_end),
+                                          value = min(torch_data$date_start),
+                                          timeFormat = "%Y-%m-%d",
+                                          step = 86400,  # Jedan dan
+                                          animate = animationOptions(interval = 500, loop = TRUE)
+                              )
+                            ),
+                            mainPanel(
+                              leafletOutput("mapa")
+                            )
+                          )
+                 ),
+
+                 # Druga vizualizacija - Rangiranje Zemalja
+                 tabPanel("Rangiranje Zemalja",
+                          sidebarLayout(
+                            sidebarPanel(
+                              dateRangeInput("dateRange", "Izaberite period:",
+                                             start = min(rank_data$medal_date),
+                                             end = max(rank_data$medal_date),
+                                             min = min(rank_data$medal_date),
+                                             max = max(rank_data$medal_date))
+                            ),
+                            mainPanel(
+                              plotlyOutput("rankingPlot", height = "600px")
+                            )
+                          )
+                 ),
+
+                 # Ostale vizualizacije ostaju iste
+                 tabPanel("Godine Medalista",
+                          sidebarLayout(
+                            sidebarPanel(
+                              selectizeInput("sports", "Izaberite sportove:",
+                                             choices = unique(rank_data$discipline),
+                                             multiple = TRUE,
+                                             selected = unique(rank_data$discipline)[1:5])  # Prvih 5 sportova automatski izabrano
+                            ),
+                            mainPanel(
+                              plotOutput("age_plot", height = "600px")
+                            )
+                          )
+                 ),
+                 tabPanel("Medal Table",
+                          sidebarLayout(
+                            sidebarPanel(
+                              selectizeInput("countries", "Select countries:",
+                                             choices = NULL,
+                                             multiple = TRUE,
+                                             options = list(placeholder = "Select countries"))
+                            ),
+                            mainPanel(
+                              plotlyOutput("medalTablePlot", height = "600px")
+                            )
+                          )
+                 ),
+                 tabPanel("Rodne Razlike",
+                          sidebarLayout(
+                            sidebarPanel(
+                              selectizeInput("selected_countries_2", "Izaberite zemlje:",
+                                             choices = athletes_data$country_code,
+                                             multiple = TRUE,
+                                             selected = c("USA", "SRB", "SLO", "FRA", "GRE"))
+                            ),
+                            mainPanel(
+                              fluidRow(
+                                column(6, plotOutput("athlete_count_plot", height = "400px")),
+                                column(6, plotOutput("medal_count_plot", height = "400px"))
+                              ),
+                              fluidRow(
+                                column(6, plotOutput("weight_plot", height = "400px")),
+                                column(6, plotOutput("height_plot", height = "400px"))
+                              )
+                            )
+                          ))
+)
+
+# Server funkcija
+server <- function(input, output, session) {
+
+  # Inicijalno postavljanje mape za Putanju Baklje
+  output$mapa <- renderLeaflet({
+    leaflet() %>%
+      addTiles()
+  })
+
+  # Ažuriranje mape prema izabranom datumu
+  observe({
+    output$mapa <- renderLeaflet({
+      vizualizuj_baklju(torch_data, input$date)
+    })
+  })
+
+  # Vizualizacija rangiranja zemalja
+  output$rankingPlot <- renderPlotly({
+    vizualizuj_rangiranje(rank_data, input$dateRange)
+  })
+
+
+  # treca vizualizacija
+  output$age_plot <- renderPlot({
+    vizualizuj_godine_medalista(athletes_data, rank_data, team_data, input$sports)
+  })
+
+
+
+
+  medal_data <- reactive({
+    data <- load_medal_data("C:/Users/Dusan/OneDrive - UPR/FAMNIT/II semestar/Vizualizacija podatkov/projekat ol/archive(2)")
+    if (is.null(data)) {
+      return(data.frame(NOC = character(), Year = numeric(), Gold = numeric(), Silver = numeric(), Bronze = numeric(), Total = numeric()))
+    }
+    return(data)
+  })
+
+  # Update country choices
+  observe({
+    data <- medal_data()
+    if (nrow(data) > 0) {
+      updateSelectizeInput(session, "countries",
+                           choices = sort(unique(data$NOC)),
+                           selected = c("USA", "SRB", "SLO", "FRA", "GRE"))
+    }
+  })
+
+  # Render medal table plot
+  output$medalTablePlot <- renderPlotly({
+    data <- medal_data()
+    if (nrow(data) == 0) {
+      return(NULL)
+    }
+    visualize_medal_table(data, input$countries)
+  })
+
+
+  # perta viz
+
+
+  # Grafikon broja sportista po zemljama i polu
+  output$athlete_count_plot <- renderPlot({
+    visualize_athlete_counts_by_gender(athletes_data, team_data, input$selected_countries_2)
+  })
+
+  # Grafikon broja medalja po zemljama i polu
+  output$medal_count_plot <- renderPlot({
+    visualize_medal_counts_by_gender(rank_data, team_data, input$selected_countries_2)
+  })
+
+  # Grafikon razlike u težini između muških i ženskih sportista
+  output$weight_plot <- renderPlot({
+    visualize_weight_differences(athletes_data, team_data)
+  })
+
+  # Grafikon razlike u visini između muških i ženskih sportista
+  output$height_plot <- renderPlot({
+    visualize_height_differences(athletes_data, team_data)
+  })
+
+  # Inicijalno postavljanje selektovanih zemalja
+  updateSelectizeInput(session, "selected_countries_2",
+                       choices = athletes_data$country_code,
+                       selected = c("USA", "SRB", "SLO", "FRA", "GRE"))
+}
+
+
+
+
+# Pokretanje Shiny aplikacije
+shinyApp(ui, server)
+
